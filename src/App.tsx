@@ -36,6 +36,7 @@ export default function App() {
 
   const [isPlaying, setIsPlaying] = useState(true);
   const [isExporting, setIsExporting] = useState(false);
+  const [exportProgress, setExportProgress] = useState<number | null>(null);
   const [activeTab, setActiveTab] = useState<'text' | 'style' | 'motion'>('text');
   const previewRef = useRef<HTMLDivElement>(null);
 
@@ -52,136 +53,166 @@ export default function App() {
   const handleExport = async () => {
     if (!previewRef.current) return;
     
-    if (!confirm("For a High-Quality 60fps video export, TypeBeat uses Screen Capture.\n\n1. Please select 'This Tab' in the upcoming permission popup.\n2. Do not scroll or resize the window during recording.\n\nNote: If this fails in the preview window, please open the app in a New Tab first.")) {
+    // Check if WebCodecs is supported
+    if (!('VideoEncoder' in window)) {
+      alert("High-quality video export is not supported in this browser. Try Chrome or Edge desktop.");
       return;
     }
 
     setIsExporting(true);
-    setIsPlaying(false);
+    setExportProgress(0);
+
+    const targetWidth = state.aspectRatio === '9:16' ? 1080 : state.aspectRatio === '1:1' ? 1440 : 1920;
+    const targetHeight = state.aspectRatio === '9:16' ? 1920 : state.aspectRatio === '1:1' ? 1440 : 1080;
     
+    const containerWidth = previewRef.current.offsetWidth;
+    const pixelRatio = targetWidth / containerWidth;
+
+    const muxer = new Muxer({
+      target: new ArrayBufferTarget(),
+      video: {
+        codec: 'V_VP9',
+        width: targetWidth,
+        height: targetHeight,
+        frameRate: 60,
+      },
+      fastStart: false
+    });
+    
+    let videoEncoder: any;
     try {
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
-        throw new Error("Screen recording not supported in this browser/mode. Please open in a new tab.");
-      }
-
-      // @ts-ignore - preferCurrentTab is a valid hint in Chrome
-      const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: { displaySurface: "browser" },
-        audio: false,
-        preferCurrentTab: true,
+      const VideoEncoderAPI = (window as any).VideoEncoder;
+      videoEncoder = new VideoEncoderAPI({
+        output: (chunk: any, meta: any) => muxer.addVideoChunk(chunk, meta),
+        error: (e: any) => console.error("Encoder Error:", e)
       });
-
-      const track = stream.getVideoTracks()[0];
       
-      const video = document.createElement('video');
-      video.srcObject = stream;
-      video.muted = true;
-      video.play();
-      
-      await new Promise(r => { video.onplaying = r; });
-
-      const canvas = document.createElement('canvas');
-      const rect = previewRef.current.getBoundingClientRect();
-      const dpr = window.devicePixelRatio || 1;
-      
-      // Render at original physical size without extra scaling to avoid blur or cutoff if captured at native device bounds
-      canvas.width = rect.width * dpr;
-      canvas.height = rect.height * dpr;
-      
-      const ctx = canvas.getContext('2d');
-      if (!ctx) throw new Error("Could not get 2D context");
-
-      // Set up media recorder
-      const canvasStream = canvas.captureStream(60);
-      let options = { mimeType: 'video/webm; codecs=vp9', videoBitsPerSecond: 8000000 };
-      if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-        options = { mimeType: 'video/webm' };
-      }
-      const recorder = new MediaRecorder(canvasStream, options);
-      const chunks: Blob[] = [];
-
-      recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) chunks.push(e.data);
-      };
-
-      const durationMs = 5000; // Record for 5 seconds
-      let recordingActive = true;
-
-      const recordingPromise = new Promise<void>((resolve, reject) => {
-        recorder.onstop = () => {
-          try {
-            const blob = new Blob(chunks, { type: 'video/webm' });
-            const url = URL.createObjectURL(blob);
-            const link = document.createElement('a');
-            link.download = 'TypeBeat-HighQuality.webm';
-            link.href = url;
-            link.click();
-            URL.revokeObjectURL(url);
-            
-            // Cleanup
-            track.stop();
-            stream.getTracks().forEach(t => t.stop());
-            resolve();
-          } catch (e) {
-            reject(e);
-          }
-        };
-        recorder.onerror = reject;
+      videoEncoder.configure({
+        codec: 'vp09.00.10.08',
+        width: targetWidth,
+        height: targetHeight,
+        bitrate: 10_000_000, // 10 Mbps
+        framerate: 60,
       });
+    } catch (err: any) {
+      alert("Video Encoder initialization failed: " + err.message);
+      setIsExporting(false);
+      setExportProgress(null);
+      return;
+    }
 
-      // Restart playing right before starting recording
+    const durationSeconds = 5;
+    const fps = 60;
+    const totalFrames = durationSeconds * fps;
+    const frameDurationMs = 1000 / fps;
+
+    let rafCallbacks: FrameRequestCallback[] = [];
+    const origRaf = window.requestAnimationFrame;
+    const origCancelRaf = window.cancelAnimationFrame;
+    const origPerf = performance.now;
+    const origDate = Date.now;
+    
+    let mockTime = origPerf.call(performance);
+
+    const startMocking = () => {
+      window.requestAnimationFrame = ((cb: FrameRequestCallback) => {
+        rafCallbacks.push(cb);
+        return 999;
+      }) as any;
+      window.cancelAnimationFrame = () => {};
+      performance.now = () => mockTime;
+      Date.now = () => mockTime;
+    };
+
+    const stopMocking = () => {
+      window.requestAnimationFrame = origRaf;
+      window.cancelAnimationFrame = origCancelRaf;
+      performance.now = origPerf;
+      Date.now = origDate;
+    };
+
+    try {
+      // 1. Reset animation
+      setIsPlaying(false);
+      await new Promise(r => setTimeout(r, 100)); // allow React to unmount
+
+      // 2. Start mocking & start animation
+      startMocking();
       setIsPlaying(true);
       
-      // Delay recording start slightly to let React render the playing state
-      await new Promise(r => setTimeout(r, 100));
-      recorder.start();
-
-      const startTime = Date.now();
+      // Wait for React to process the re-mount
+      await new Promise(r => setTimeout(r, 50));
       
-      const captureFrame = () => {
-        if (!recordingActive) return;
+      // Initial ticks to flush Framer Motion's boot sequence
+      for(let j=0; j<3; j++) {
+        mockTime += 1;
+        const currentCbs = rafCallbacks;
+        rafCallbacks = [];
+        currentCbs.forEach(cb => { try { cb(mockTime); } catch (e) { } });
+      }
 
-        if (Date.now() - startTime > durationMs) {
-          recordingActive = false;
-          recorder.stop();
-          return;
-        }
+      // 3. Render loop
+      for (let i = 0; i < totalFrames; i++) {
+        // Tick time
+        mockTime += frameDurationMs;
+        const currentCbs = rafCallbacks;
+        rafCallbacks = [];
         
-        if (previewRef.current) {
-          try {
-            const currentRect = previewRef.current.getBoundingClientRect();
-            // Calculate scale based on captured video dimensions vs current window size
-            const scaleX = video.videoWidth / window.innerWidth;
-            const scaleY = video.videoHeight / window.innerHeight;
-            
-            ctx.drawImage(
-              video, 
-              currentRect.left * scaleX, 
-              currentRect.top * scaleY, 
-              currentRect.width * scaleX, 
-              currentRect.height * scaleY, 
-              0, 
-              0, 
-              canvas.width, 
-              canvas.height
-            );
-          } catch (e) {
-            console.error("Frame capture error:", e);
-          }
-        }
-        
-        // Schedule next frame
-        requestAnimationFrame(captureFrame);
-      };
+        // Framer Motion reads time during these callbacks and applies styles
+        currentCbs.forEach(cb => { try { cb(mockTime); } catch(e) {} });
 
-      captureFrame();
-      await recordingPromise;
+        // Let browser paint or settle DOM changes.
+        // We restore original functions so htmlToImage works normally.
+        stopMocking();
+        
+        // Render current DOM state offline
+        const frameCanvas = await htmlToImage.toCanvas(previewRef.current, {
+           quality: 1,
+           pixelRatio: pixelRatio,
+           canvasWidth: targetWidth,
+           canvasHeight: targetHeight,
+           skipFonts: false,
+        });
+        
+        const timestampMicroseconds = (i * 1000000) / fps;
+        const VideoFrameAPI = (window as any).VideoFrame;
+        const frame = new VideoFrameAPI(frameCanvas, { timestamp: timestampMicroseconds });
+        const keyFrame = (i % 60 === 0); // 1 keyframe per second
+        
+        videoEncoder.encode(frame, { keyFrame });
+        frame.close();
+        
+        setExportProgress(Math.round((i / totalFrames) * 100));
+        
+        // Let React update the progress bar UI smoothly
+        await new Promise(r => setTimeout(r, 0));
+
+        // Resume mocking for the next tick
+        startMocking();
+      }
+
+      // Flush and Finalize
+      stopMocking();
+      await videoEncoder.flush();
+      videoEncoder.close();
+      muxer.finalize();
+
+      const buffer = muxer.target.buffer;
+      const blob = new Blob([buffer], { type: 'video/webm' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.download = 'TypeBeat-2K.webm';
+      link.href = url;
+      link.click();
+      URL.revokeObjectURL(url);
       
     } catch (err: any) {
-      console.error('Export failed', err);
-      alert(`Export failed: ${err.message || 'Screen recording permission denied'}\n\nPlease try opening the app in a NEW TAB instead of the preview window.`);
+      console.error(err);
+      alert('Failed to export high quality video: ' + err.message);
     } finally {
+      stopMocking();
       setIsExporting(false);
+      setExportProgress(null);
       setIsPlaying(true);
     }
   };
@@ -208,8 +239,8 @@ export default function App() {
             disabled={isExporting}
             className="flex items-center gap-2 bg-white text-black px-4 py-2 rounded-full font-bold text-sm hover:bg-neutral-200 transition-colors disabled:opacity-50"
           >
-            {isExporting ? <Loader2 size={16} className="animate-spin" /> : <Download size={16} />}
-            {isExporting ? 'Exporting...' : 'Export'}
+            <Download size={16} />
+            {isExporting ? `Exporting ${exportProgress}%...` : 'Export 2K'}
           </button>
         </header>
 
